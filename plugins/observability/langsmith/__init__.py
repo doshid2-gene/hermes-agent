@@ -517,7 +517,10 @@ def on_api_request_error(*, task_id: str = "", session_id: str = "", error: Any 
     if state is None:
         return
     state.is_error = True
-    if error is not None:
+    # Hermes passes error={"type":..., "message":...}; keep the message.
+    if isinstance(error, dict):
+        state.error = str(error.get("message") or error.get("type") or "api_request_error")
+    elif error is not None:
         state.error = str(error)
 
 

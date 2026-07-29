@@ -261,6 +261,31 @@ def test_api_request_error_marks_root(monkeypatch):
     assert last["error"] == "ratelimited"
 
 
+def test_api_request_error_extracts_dict_message(monkeypatch):
+    # Hermes fires api_request_error with error={"type":..., "message":...}
+    # (run_agent.py:_invoke_api_request_error_hook) - store the message, not the dict repr.
+    ls, spy = _module_with_spy(monkeypatch)
+    kw = dict(task_id="t9", session_id="s9", turn_id="tn", api_request_id="r9")
+    ls.on_pre_llm_request(model="m", provider="openai",
+                          messages=[{"role": "user", "content": "hi"}],
+                          api_call_count=1, **kw)
+    ls.on_api_request_error(
+        error={"type": "RateLimitError", "message": "429 slow down"},
+        retryable=False, **kw)
+
+    class _Final:
+        content = "ok"
+        reasoning = ""
+        tool_calls = []
+
+    ls.on_post_llm_call(model="m", provider="openai", api_call_count=1,
+                        assistant_message=_Final(), usage=None,
+                        finish_reason="stop", assistant_tool_call_count=0, **kw)
+    root = _by_name(spy, "task:t9")
+    last = [u for u in spy.updated if u.get("run_id") == root["id"]][-1]
+    assert last["error"] == "429 slow down"
+
+
 def test_post_without_pre_lazily_creates_root(monkeypatch):
     ls, spy = _module_with_spy(monkeypatch)
     kw = dict(task_id="t3", session_id="s3", turn_id="turn-y", api_request_id="r2")
