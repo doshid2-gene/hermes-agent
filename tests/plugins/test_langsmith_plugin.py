@@ -9,8 +9,13 @@ from __future__ import annotations
 import importlib
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
+import yaml
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+PLUGIN_DIR = REPO_ROOT / "plugins" / "observability" / "langsmith"
 
 
 def _fresh_module():
@@ -296,3 +301,45 @@ def test_register_binds_expected_hooks(monkeypatch):
     ls.register(_Ctx())
     assert {"pre_api_request", "post_api_request", "pre_tool_call",
             "post_tool_call", "api_request_error"} <= set(bound)
+
+
+# ---------------------------------------------------------------------------
+# Task 4: manifest + layout + opt-in discovery
+# ---------------------------------------------------------------------------
+
+def test_plugin_directory_and_files_exist():
+    assert PLUGIN_DIR.is_dir()
+    assert (PLUGIN_DIR / "plugin.yaml").exists()
+    assert (PLUGIN_DIR / "__init__.py").exists()
+    assert (PLUGIN_DIR / "README.md").exists()
+
+
+def test_manifest_fields():
+    data = yaml.safe_load((PLUGIN_DIR / "plugin.yaml").read_text())
+    assert data["name"] == "langsmith"
+    assert data["version"]
+    assert set(data["hooks"]) == {
+        "pre_api_request", "post_api_request",
+        "pre_llm_call", "post_llm_call",
+        "pre_tool_call", "post_tool_call",
+        "api_request_error",
+    }
+    assert "LANGSMITH_API_KEY" in data["requires_env"]
+
+
+def test_plugin_is_discovered_as_standalone_opt_in(tmp_path, monkeypatch):
+    """Scanner finds the plugin but does NOT load it by default (opt-in)."""
+    from hermes_cli import plugins as plugins_mod
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    manager = plugins_mod.PluginManager()
+    manager.discover_and_load()
+
+    loaded = manager._plugins.get("observability/langsmith")
+    assert loaded is not None, "plugin not discovered"
+    assert loaded.enabled is False
+    assert "not enabled" in (loaded.error or "").lower()
