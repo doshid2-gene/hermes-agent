@@ -441,14 +441,12 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", model: str = ""
     task_key = _trace_key(task_id, session_id, turn_id=turn_id, api_request_id=api_request_id)
     state = _get_state(task_key)
     if state is None:
-        # Legacy paths may skip the pre-hook; open the root lazily.
-        on_pre_llm_request(task_id=task_id, session_id=session_id, model=model,
-                           provider=provider, api_mode=api_mode,
-                           api_call_count=api_call_count, user_message="",
-                           turn_id=turn_id, api_request_id=api_request_id)
-        state = _get_state(task_key)
-        if state is None:
-            return
+        # No open root for this turn: either a duplicate post-hook firing after
+        # finish already popped the state (Hermes fires both post_api_request and
+        # legacy post_llm_call), or a legacy post with no preceding pre. Do NOT
+        # lazily open a root here — that spawns an empty-question orphan root.
+        # Match langfuse, which no-ops when state is absent.
+        return
     text = ""
     thinking = ""
     if assistant_message is not None:
