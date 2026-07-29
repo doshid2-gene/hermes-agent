@@ -179,3 +179,120 @@ def test_error_marks_root():
                error="boom", session_id="s1", total_cost_usd=None)
     last = [u for u in spy.updated if u.get("run_id") == state.root_id][-1]
     assert last["error"] == "boom"
+
+
+# ---------------------------------------------------------------------------
+# Task 3: hook handlers building the tree via the plugin system
+# ---------------------------------------------------------------------------
+
+def _module_with_spy(monkeypatch):
+    monkeypatch.setenv("LANGSMITH_API_KEY", "ls-test-key")
+    ls = _fresh_module()
+    spy = _SpyClient()
+    monkeypatch.setattr(ls, "_client", lambda: spy)
+    return ls, spy
+
+
+def test_hooks_build_chain_llm_tool_and_finish(monkeypatch):
+    ls, spy = _module_with_spy(monkeypatch)
+    kw = dict(task_id="t1", session_id="s1", turn_id="turn-abc", api_request_id="req1")
+    ls.on_pre_llm_request(model="m", provider="openai",
+                          messages=[{"role": "user", "content": "hi"}],
+                          api_call_count=1, **kw)
+
+    class _Msg:
+        content = ""
+        reasoning = "thinking..."
+        tool_calls = [object()]
+
+    ls.on_post_llm_call(model="m", provider="openai", api_call_count=1,
+                        assistant_message=_Msg(),
+                        usage={"input_tokens": 10, "output_tokens": 5},
+                        finish_reason="tool_calls", assistant_tool_call_count=1, **kw)
+    ls.on_pre_tool_call(tool_name="read_file", args={"path": "a"}, tool_call_id="tc1", **kw)
+    ls.on_post_tool_call(tool_name="read_file", args={"path": "a"}, result="ok",
+                         tool_call_id="tc1", **kw)
+
+    class _Final:
+        content = "the answer"
+        reasoning = ""
+        tool_calls = []
+
+    ls.on_post_llm_call(model="m", provider="openai", api_call_count=2,
+                        assistant_message=_Final(),
+                        usage={"input_tokens": 8, "output_tokens": 12},
+                        finish_reason="stop", assistant_tool_call_count=0, **kw)
+
+    root = _by_name(spy, "task:t1")
+    turn1 = _by_name(spy, "turn 1")
+    tool = _by_name(spy, "read_file")
+    assert root["run_type"] == "chain"
+    assert turn1["parent_run_id"] == root["id"]
+    assert tool["parent_run_id"] == turn1["id"]
+    root_updates = [u for u in spy.updated if u.get("run_id") == root["id"]]
+    assert root_updates and root_updates[-1]["outputs"]["answer"] == "the answer"
+    assert root_updates[-1]["extra"]["metadata"]["used_tools"] == ["read_file"]
+    assert root_updates[-1]["extra"]["metadata"]["num_turns"] == 2
+
+
+def test_api_request_error_marks_root(monkeypatch):
+    ls, spy = _module_with_spy(monkeypatch)
+    kw = dict(task_id="t2", session_id="s2", turn_id="turn-x", api_request_id="r1")
+    ls.on_pre_llm_request(model="m", provider="openai",
+                          messages=[{"role": "user", "content": "hi"}],
+                          api_call_count=1, **kw)
+    ls.on_api_request_error(error="ratelimited", **kw)
+
+    class _Final:
+        content = "recovered"
+        reasoning = ""
+        tool_calls = []
+
+    ls.on_post_llm_call(model="m", provider="openai", api_call_count=1,
+                        assistant_message=_Final(), usage=None,
+                        finish_reason="stop", assistant_tool_call_count=0, **kw)
+    root = _by_name(spy, "task:t2")
+    last = [u for u in spy.updated if u.get("run_id") == root["id"]][-1]
+    assert last["error"] == "ratelimited"
+
+
+def test_post_without_pre_lazily_creates_root(monkeypatch):
+    ls, spy = _module_with_spy(monkeypatch)
+    kw = dict(task_id="t3", session_id="s3", turn_id="turn-y", api_request_id="r2")
+
+    class _Final:
+        content = "hello"
+        reasoning = ""
+        tool_calls = []
+
+    ls.on_post_llm_call(model="m", provider="openai", api_call_count=1,
+                        assistant_message=_Final(), usage=None,
+                        finish_reason="stop", assistant_tool_call_count=0, **kw)
+    assert _by_name(spy, "task:t3")["run_type"] == "chain"
+    assert _by_name(spy, "turn 1")["run_type"] == "llm"
+
+
+def test_disabled_hooks_never_raise(monkeypatch):
+    for var in ("LANGSMITH_API_KEY", "LANGCHAIN_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    ls = _fresh_module()
+    # no client -> every hook is a no-op and must not raise
+    ls.on_pre_llm_request(task_id="t", session_id="s",
+                          messages=[{"role": "user", "content": "x"}])
+    ls.on_post_llm_call(task_id="t", session_id="s", assistant_message=None, usage=None)
+    ls.on_pre_tool_call(task_id="t", session_id="s", tool_name="x", args={}, tool_call_id="1")
+    ls.on_post_tool_call(task_id="t", session_id="s", tool_name="x", result="y", tool_call_id="1")
+    ls.on_api_request_error(task_id="t", session_id="s", error="e")
+
+
+def test_register_binds_expected_hooks(monkeypatch):
+    ls = _fresh_module()
+    bound = {}
+
+    class _Ctx:
+        def register_hook(self, name, fn):
+            bound[name] = fn
+
+    ls.register(_Ctx())
+    assert {"pre_api_request", "post_api_request", "pre_tool_call",
+            "post_tool_call", "api_request_error"} <= set(bound)

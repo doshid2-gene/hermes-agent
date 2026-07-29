@@ -276,3 +276,230 @@ def _finish(client: Any, state: TraceState, *, answer: str, num_turns: Optional[
         )
     except Exception as exc:  # noqa: BLE001
         logger.debug("LangSmith finish failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Per-turn trace state, keyed so concurrent gateway turns never collide.
+# _scope_prefix / _trace_key copied verbatim from the langfuse plugin.
+# ---------------------------------------------------------------------------
+
+_STATE_LOCK = threading.Lock()
+_TRACE_STATE: Dict[str, TraceState] = {}
+# Bound the leak from turns that never reach a clean finish (interrupted,
+# tool-only final step, empty final content); evict least-recently-updated.
+_MAX_TRACE_STATE = 256
+
+
+def _scope_prefix(task_id: str, session_id: str) -> str:
+    if task_id:
+        return f"task:{task_id}"
+    if session_id:
+        return f"session:{session_id}"
+    return f"thread:{threading.get_ident()}"
+
+
+def _trace_key(task_id: str, session_id: str, *, turn_id: str = "",
+               api_request_id: str = "") -> str:
+    if turn_id:
+        return f"{_scope_prefix(task_id, session_id)}:turn:{turn_id}"
+    if api_request_id:
+        return f"{_scope_prefix(task_id, session_id)}:api:{api_request_id}"
+    if task_id:
+        return task_id
+    return _scope_prefix(task_id, session_id)
+
+
+def _extract_last_user_message(messages: Any) -> Any:
+    if not isinstance(messages, list):
+        return None
+    for message in reversed(messages):
+        if isinstance(message, dict) and message.get("role") == "user":
+            return message.get("content")
+    return None
+
+
+def _evict_stale_locked() -> None:
+    """Drop least-recently-updated trace state to make room for one new entry.
+
+    Caller MUST hold ``_STATE_LOCK``. Evict down to ``_MAX_TRACE_STATE - 1`` so
+    the about-to-be-added entry leaves the dict at the ceiling. The evicted
+    root run is closed so it is not left dangling on the LangSmith side.
+    """
+    over = len(_TRACE_STATE) - (_MAX_TRACE_STATE - 1)
+    if over <= 0:
+        return
+    stale = sorted(_TRACE_STATE.items(), key=lambda kv: kv[1].last_updated_at)[:over]
+    client = _client()
+    for key, state in stale:
+        _TRACE_STATE.pop(key, None)
+        if client is None:
+            continue
+        try:
+            client.update_run(run_id=state.root_id, end_time=datetime.now(UTC))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("LangSmith evict close failed: %s", exc)
+
+
+def _get_state(task_key: str) -> Optional[TraceState]:
+    with _STATE_LOCK:
+        return _TRACE_STATE.get(task_key)
+
+
+def _assistant_has_tool_calls(message: Any) -> bool:
+    return bool(getattr(message, "tool_calls", None))
+
+
+# ---------------------------------------------------------------------------
+# Hook handlers. Registered for both the request-scoped (pre/post_api_request)
+# and legacy turn-scoped (pre/post_llm_call) hook names, matching langfuse.
+# ---------------------------------------------------------------------------
+
+def on_pre_llm_request(*, task_id: str = "", session_id: str = "", platform: str = "",
+                       model: str = "", provider: str = "", api_mode: str = "",
+                       api_call_count: int = 0, request_messages: Any = None,
+                       messages: Any = None, conversation_history: Any = None,
+                       user_message: Any = None, turn_id: str = "",
+                       api_request_id: str = "", **_: Any) -> None:
+    client = _client()
+    if client is None:
+        return
+    msgs = None
+    for cand in (request_messages, messages, conversation_history):
+        if isinstance(cand, list):
+            msgs = cand
+            break
+    # Current Hermes also fires a turn-scoped pre_llm_call for context injection
+    # (no messages list); tracing that would create an orphan root. Only open a
+    # root when we have request messages or an explicit user_message.
+    if msgs is None and user_message is None:
+        return
+    task_key = _trace_key(task_id, session_id, turn_id=turn_id, api_request_id=api_request_id)
+    with _STATE_LOCK:
+        if task_key in _TRACE_STATE:
+            _TRACE_STATE[task_key].last_updated_at = time.time()
+            return
+        _evict_stale_locked()
+    try:
+        from hermes_cli.build_info import get_build_sha
+
+        git_commit = get_build_sha()
+    except Exception:  # noqa: BLE001
+        git_commit = None
+    metadata = {
+        "source": "hermes", "task_id": task_id, "session_id": session_id,
+        "turn_id": turn_id, "platform": platform, "provider": provider,
+        "model": model, "api_mode": api_mode, "git_commit": git_commit,
+    }
+    state = _start_root(
+        client, task_id=task_id, session_id=session_id,
+        user_query=_extract_last_user_message(msgs) or user_message or "",
+        metadata=metadata,
+    )
+    with _STATE_LOCK:
+        _TRACE_STATE[task_key] = state
+
+
+def on_post_llm_call(*, task_id: str = "", session_id: str = "", model: str = "",
+                     provider: str = "", api_mode: str = "", api_call_count: int = 0,
+                     assistant_message: Any = None, assistant_response: Any = None,
+                     usage: Any = None, finish_reason: str = "",
+                     assistant_tool_call_count: int = 0, started_at: Any = None,
+                     ended_at: Any = None, api_duration: float = 0.0,
+                     turn_id: str = "", api_request_id: str = "", **_: Any) -> None:
+    client = _client()
+    if client is None:
+        return
+    task_key = _trace_key(task_id, session_id, turn_id=turn_id, api_request_id=api_request_id)
+    state = _get_state(task_key)
+    if state is None:
+        # Legacy paths may skip the pre-hook; open the root lazily.
+        on_pre_llm_request(task_id=task_id, session_id=session_id, model=model,
+                           provider=provider, api_mode=api_mode,
+                           api_call_count=api_call_count, user_message="",
+                           turn_id=turn_id, api_request_id=api_request_id)
+        state = _get_state(task_key)
+        if state is None:
+            return
+    text = ""
+    thinking = ""
+    if assistant_message is not None:
+        text = getattr(assistant_message, "content", "") or ""
+        thinking = getattr(assistant_message, "reasoning", "") or ""
+    elif isinstance(assistant_response, str):
+        text = assistant_response
+    end = ended_at if isinstance(ended_at, datetime) else datetime.now(UTC)
+    start = started_at if isinstance(started_at, datetime) else end
+    usage_dict = usage if isinstance(usage, dict) else None
+    _record_turn(client, state, index=api_call_count or (state.num_turns + 1),
+                 model=model, thinking=thinking, text=text, usage=usage_dict,
+                 started_at=start, ended_at=end)
+    if text:
+        state.answer = text
+    state.last_updated_at = time.time()
+    has_tools = (
+        _assistant_has_tool_calls(assistant_message)
+        if assistant_message is not None
+        else (assistant_tool_call_count > 0)
+    )
+    if text and not has_tools:
+        with _STATE_LOCK:
+            _TRACE_STATE.pop(task_key, None)
+        _finish(client, state, answer=state.answer, num_turns=state.num_turns,
+                used_tools=sorted(state.used_tools), is_error=state.is_error,
+                error=state.error, session_id=session_id, total_cost_usd=None)
+
+
+def on_pre_tool_call(*, tool_name: str = "", args: Any = None, task_id: str = "",
+                     session_id: str = "", tool_call_id: str = "", turn_id: str = "",
+                     api_request_id: str = "", **_: Any) -> None:
+    client = _client()
+    if client is None:
+        return
+    state = _get_state(_trace_key(task_id, session_id, turn_id=turn_id,
+                                  api_request_id=api_request_id))
+    if state is None:
+        return
+    _start_tool(client, state, tool_name=tool_name, args=args,
+                tool_call_id=tool_call_id, started_at=datetime.now(UTC))
+
+
+def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = None,
+                      task_id: str = "", session_id: str = "", tool_call_id: str = "",
+                      turn_id: str = "", api_request_id: str = "", status: str = "",
+                      error_type: str = "", **_: Any) -> None:
+    client = _client()
+    if client is None:
+        return
+    state = _get_state(_trace_key(task_id, session_id, turn_id=turn_id,
+                                  api_request_id=api_request_id))
+    if state is None:
+        return
+    is_error = bool(error_type) or (status not in ("", "ok", "success"))
+    _end_tool(client, state, tool_name=tool_name, result=result,
+              tool_call_id=tool_call_id, is_error=is_error, ended_at=datetime.now(UTC))
+
+
+def on_api_request_error(*, task_id: str = "", session_id: str = "", error: Any = None,
+                         turn_id: str = "", api_request_id: str = "", **_: Any) -> None:
+    if _client() is None:
+        return
+    state = _get_state(_trace_key(task_id, session_id, turn_id=turn_id,
+                                  api_request_id=api_request_id))
+    if state is None:
+        return
+    state.is_error = True
+    if error is not None:
+        state.error = str(error)
+
+
+def register(ctx) -> None:
+    # pre/post_api_request fire per API call (preferred); pre/post_llm_call are
+    # the legacy per-turn names. Register both so the plugin works across
+    # Hermes versions, matching the langfuse plugin.
+    ctx.register_hook("pre_api_request", on_pre_llm_request)
+    ctx.register_hook("post_api_request", on_post_llm_call)
+    ctx.register_hook("pre_llm_call", on_pre_llm_request)
+    ctx.register_hook("post_llm_call", on_post_llm_call)
+    ctx.register_hook("pre_tool_call", on_pre_tool_call)
+    ctx.register_hook("post_tool_call", on_post_tool_call)
+    ctx.register_hook("api_request_error", on_api_request_error)
