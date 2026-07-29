@@ -299,8 +299,57 @@ def test_register_binds_expected_hooks(monkeypatch):
             bound[name] = fn
 
     ls.register(_Ctx())
-    assert {"pre_api_request", "post_api_request", "pre_tool_call",
-            "post_tool_call", "api_request_error"} <= set(bound)
+    assert set(bound) == {
+        "pre_api_request", "post_api_request",
+        "pre_llm_call", "post_llm_call",
+        "pre_tool_call", "post_tool_call",
+        "api_request_error",
+    }
+
+
+def test_start_root_failure_is_noop():
+    """If the root create_run fails, the state is a no-op: no orphaned child
+    runs get created under a non-existent parent (matches TaskTrace)."""
+    ls = _fresh_module()
+
+    class _FailingClient:
+        def __init__(self):
+            self.created = []
+            self.updated = []
+
+        def create_run(self, **kw):
+            raise RuntimeError("boom")
+
+        def update_run(self, **kw):
+            self.updated.append(kw)
+
+    c = _FailingClient()
+    state = ls._start_root(c, task_id="t", session_id="s", user_query="q", metadata={})
+    assert state.root_id is None
+    ls._record_turn(c, state, index=1, model="m", thinking="", text="hi",
+                    usage=None, started_at=_now(), ended_at=_now())
+    ls._start_tool(c, state, tool_name="x", args={}, tool_call_id="1", started_at=_now())
+    ls._end_tool(c, state, tool_name="x", result="r", tool_call_id="1",
+                 is_error=False, ended_at=_now())
+    ls._finish(c, state, answer="a", num_turns=1, used_tools=[], is_error=False,
+               error=None, session_id="s", total_cost_usd=None)
+    # No child runs and no updates against a parent that never existed.
+    assert c.updated == []
+
+
+def test_eviction_closes_oldest_root(monkeypatch):
+    ls, spy = _module_with_spy(monkeypatch)
+    monkeypatch.setattr(ls, "_MAX_TRACE_STATE", 2)
+    for i in range(3):
+        ls.on_pre_llm_request(task_id=f"t{i}", session_id="s", turn_id=f"turn{i}",
+                              api_request_id=f"r{i}",
+                              messages=[{"role": "user", "content": "hi"}])
+    with ls._STATE_LOCK:
+        assert len(ls._TRACE_STATE) <= 2
+    root0 = _by_name(spy, "task:t0")
+    closed = [u for u in spy.updated
+              if u.get("run_id") == root0["id"] and "end_time" in u]
+    assert closed, "evicted oldest root should be closed with an end_time"
 
 
 # ---------------------------------------------------------------------------

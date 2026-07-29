@@ -60,3 +60,7 @@ never collide, and stale state is evicted to bound memory.
 
 `delegate_task` subagents appear as ordinary `tool` runs under the turn that spawned
 them.
+
+Note: per-run `total_cost_usd` is not populated - the hook payloads carry token
+usage but not an aggregated cost. Token counts are recorded per turn via
+`usage_metadata`; cost can be derived downstream from those and the model.

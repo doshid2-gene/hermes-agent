@@ -32,7 +32,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,7 @@ def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
 
 
-def _api_key() -> Optional[str]:
+def _api_key() -> str | None:
     return _env("LANGSMITH_API_KEY") or _env("LANGCHAIN_API_KEY") or None
 
 
@@ -95,7 +95,7 @@ def _client() -> Any:
     try:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         endpoint = _env("LANGSMITH_ENDPOINT") or _env("LANGCHAIN_ENDPOINT")
-        kwargs: Dict[str, Any] = {"api_key": _api_key()}
+        kwargs: dict[str, Any] = {"api_key": _api_key()}
         if endpoint:
             kwargs["api_url"] = endpoint  # verbatim - keep /api/v1
         client = Client(**kwargs)
@@ -106,7 +106,7 @@ def _client() -> Any:
         _LANGSMITH_CLIENT = client
         return client
     except Exception as exc:  # noqa: BLE001 - never break the run on client init
-        logger.debug("LangSmith client init failed: %s", exc)
+        logger.debug("LangSmith client init failed: %s", type(exc).__name__)
         _LANGSMITH_CLIENT = _INIT_FAILED
         return None
 
@@ -119,20 +119,22 @@ def _client() -> Any:
 
 @dataclass
 class TraceState:
-    root_id: str
-    metadata: Dict[str, Any] = field(default_factory=dict)
-    current_turn_id: Optional[str] = None
-    tools_by_id: Dict[str, str] = field(default_factory=dict)
-    pending_tools_by_name: Dict[str, List[str]] = field(default_factory=dict)
+    # ``root_id is None`` marks a no-op trace (root create_run failed): every
+    # helper short-circuits so we never emit children under a nonexistent parent.
+    root_id: str | None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    current_turn_id: str | None = None
+    tools_by_id: dict[str, str] = field(default_factory=dict)
+    pending_tools_by_name: dict[str, list[str]] = field(default_factory=dict)
     num_turns: int = 0
-    used_tools: set = field(default_factory=set)
+    used_tools: set[str] = field(default_factory=set)
     is_error: bool = False
-    error: Optional[str] = None
+    error: str | None = None
     answer: str = ""
     last_updated_at: float = field(default_factory=time.time)
 
 
-def _usage_metadata(usage: Optional[dict]) -> Dict[str, Any]:
+def _usage_metadata(usage: dict | None) -> dict[str, Any]:
     """Map a CanonicalUsage summary dict to TaskTrace's usage_metadata shape."""
     if not usage:
         return {}
@@ -146,7 +148,7 @@ def _usage_metadata(usage: Optional[dict]) -> Dict[str, Any]:
         )
         if v is not None
     }
-    um: Dict[str, Any] = {
+    um: dict[str, Any] = {
         "input_tokens": inp,
         "output_tokens": out,
         "total_tokens": (inp or 0) + (out or 0),
@@ -157,7 +159,7 @@ def _usage_metadata(usage: Optional[dict]) -> Dict[str, Any]:
 
 
 def _start_root(client: Any, *, task_id: str, session_id: str, user_query: Any,
-                metadata: Dict[str, Any]) -> TraceState:
+                metadata: dict[str, Any]) -> TraceState:
     root_id = uuid.uuid4().hex
     clean = {k: v for k, v in metadata.items() if v is not None}
     try:
@@ -170,19 +172,22 @@ def _start_root(client: Any, *, task_id: str, session_id: str, user_query: Any,
             start_time=datetime.now(UTC),
             extra={"metadata": clean},
         )
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("LangSmith start_root failed: %s", exc)
+    except Exception as exc:  # noqa: BLE001 - fail open, but don't emit children
+        logger.debug("LangSmith start_root failed: %s", type(exc).__name__)
+        return TraceState(root_id=None, metadata=clean)
     return TraceState(root_id=root_id, metadata=clean)
 
 
-def _record_turn(client: Any, state: TraceState, *, index: int, model: Optional[str],
-                 thinking: str, text: str, usage: Optional[dict],
+def _record_turn(client: Any, state: TraceState, *, index: int, model: str | None,
+                 thinking: str, text: str, usage: dict | None,
                  started_at: datetime, ended_at: datetime) -> None:
+    if state.root_id is None:
+        return
     turn_id = uuid.uuid4().hex
-    out_msg: Dict[str, Any] = {"role": "assistant", "content": text}
+    out_msg: dict[str, Any] = {"role": "assistant", "content": text}
     if thinking:
         out_msg["thinking"] = _jsonable(thinking)
-    extra: Dict[str, Any] = {"metadata": {"model": model, "turn": index}}
+    extra: dict[str, Any] = {"metadata": {"model": model, "turn": index}}
     um = _usage_metadata(usage)
     if um:
         extra["metadata"]["usage_metadata"] = um
@@ -207,6 +212,8 @@ def _record_turn(client: Any, state: TraceState, *, index: int, model: Optional[
 
 def _start_tool(client: Any, state: TraceState, *, tool_name: str, args: Any,
                 tool_call_id: str, started_at: datetime) -> None:
+    if state.root_id is None:
+        return
     parent = state.current_turn_id or state.root_id
     tool_id = uuid.uuid4().hex
     try:
@@ -232,6 +239,8 @@ def _start_tool(client: Any, state: TraceState, *, tool_name: str, args: Any,
 
 def _end_tool(client: Any, state: TraceState, *, tool_name: str, result: Any,
               tool_call_id: str, is_error: bool, ended_at: datetime) -> None:
+    if state.root_id is None:
+        return
     tool_id = None
     if tool_call_id:
         tool_id = state.tools_by_id.pop(tool_call_id, None)
@@ -254,9 +263,11 @@ def _end_tool(client: Any, state: TraceState, *, tool_name: str, result: Any,
         logger.debug("LangSmith end_tool failed: %s", exc)
 
 
-def _finish(client: Any, state: TraceState, *, answer: str, num_turns: Optional[int],
-            used_tools: Optional[list], is_error: bool, error: Optional[str],
-            session_id: Optional[str], total_cost_usd: Optional[float]) -> None:
+def _finish(client: Any, state: TraceState, *, answer: str, num_turns: int | None,
+            used_tools: list[str] | None, is_error: bool, error: str | None,
+            session_id: str | None, total_cost_usd: float | None) -> None:
+    if state.root_id is None:
+        return
     md = {
         **state.metadata,
         "num_turns": num_turns if num_turns is not None else state.num_turns,
@@ -283,8 +294,13 @@ def _finish(client: Any, state: TraceState, *, answer: str, num_turns: Optional[
 # _scope_prefix / _trace_key copied verbatim from the langfuse plugin.
 # ---------------------------------------------------------------------------
 
+# _STATE_LOCK guards dict membership of _TRACE_STATE and eviction only. Network
+# I/O (create_run/update_run) is always done OUTSIDE the lock. Single-attribute
+# writes to a TraceState (num_turns, answer, is_error, last_updated_at) rely on
+# CPython's GIL for atomicity; on a free-threaded build they are benign races
+# (last-writer-wins on independent scalars, never a corrupt tree).
 _STATE_LOCK = threading.Lock()
-_TRACE_STATE: Dict[str, TraceState] = {}
+_TRACE_STATE: dict[str, TraceState] = {}
 # Bound the leak from turns that never reach a clean finish (interrupted,
 # tool-only final step, empty final content); evict least-recently-updated.
 _MAX_TRACE_STATE = 256
@@ -318,29 +334,34 @@ def _extract_last_user_message(messages: Any) -> Any:
     return None
 
 
-def _evict_stale_locked() -> None:
-    """Drop least-recently-updated trace state to make room for one new entry.
+def _pop_stale_locked() -> list[TraceState]:
+    """Pop least-recently-updated trace state to make room for one new entry.
 
-    Caller MUST hold ``_STATE_LOCK``. Evict down to ``_MAX_TRACE_STATE - 1`` so
-    the about-to-be-added entry leaves the dict at the ceiling. The evicted
-    root run is closed so it is not left dangling on the LangSmith side.
+    Caller MUST hold ``_STATE_LOCK``. Evicts down to ``_MAX_TRACE_STATE - 1`` so
+    the about-to-be-added entry leaves the dict at the ceiling. Returns the
+    evicted states so the caller can close their root runs OUTSIDE the lock -
+    no network I/O is done while the lock is held.
     """
     over = len(_TRACE_STATE) - (_MAX_TRACE_STATE - 1)
     if over <= 0:
-        return
+        return []
     stale = sorted(_TRACE_STATE.items(), key=lambda kv: kv[1].last_updated_at)[:over]
-    client = _client()
-    for key, state in stale:
+    for key, _state in stale:
         _TRACE_STATE.pop(key, None)
-        if client is None:
-            continue
-        try:
-            client.update_run(run_id=state.root_id, end_time=datetime.now(UTC))
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("LangSmith evict close failed: %s", exc)
+    return [s for _, s in stale]
 
 
-def _get_state(task_key: str) -> Optional[TraceState]:
+def _close_root(client: Any, state: TraceState) -> None:
+    """Close a root run's end_time (evicted straggler or a lost-race duplicate)."""
+    if client is None or state.root_id is None:
+        return
+    try:
+        client.update_run(run_id=state.root_id, end_time=datetime.now(UTC))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("LangSmith close_root failed: %s", type(exc).__name__)
+
+
+def _get_state(task_key: str) -> TraceState | None:
     with _STATE_LOCK:
         return _TRACE_STATE.get(task_key)
 
@@ -375,10 +396,14 @@ def on_pre_llm_request(*, task_id: str = "", session_id: str = "", platform: str
         return
     task_key = _trace_key(task_id, session_id, turn_id=turn_id, api_request_id=api_request_id)
     with _STATE_LOCK:
-        if task_key in _TRACE_STATE:
-            _TRACE_STATE[task_key].last_updated_at = time.time()
+        existing = _TRACE_STATE.get(task_key)
+        if existing is not None:
+            existing.last_updated_at = time.time()
             return
-        _evict_stale_locked()
+        evicted = _pop_stale_locked()
+    # Close evicted roots outside the lock so slow I/O never stalls other hooks.
+    for st in evicted:
+        _close_root(client, st)
     try:
         from hermes_cli.build_info import get_build_sha
 
@@ -395,8 +420,12 @@ def on_pre_llm_request(*, task_id: str = "", session_id: str = "", platform: str
         user_query=_extract_last_user_message(msgs) or user_message or "",
         metadata=metadata,
     )
+    # Atomic set-if-absent: if a concurrent hook for the same key won the race,
+    # keep its state and close our duplicate root (never orphan it).
     with _STATE_LOCK:
-        _TRACE_STATE[task_key] = state
+        winner = _TRACE_STATE.setdefault(task_key, state)
+    if winner is not state:
+        _close_root(client, state)
 
 
 def on_post_llm_call(*, task_id: str = "", session_id: str = "", model: str = "",
@@ -492,7 +521,7 @@ def on_api_request_error(*, task_id: str = "", session_id: str = "", error: Any 
         state.error = str(error)
 
 
-def register(ctx) -> None:
+def register(ctx: Any) -> None:
     # pre/post_api_request fire per API call (preferred); pre/post_llm_call are
     # the legacy per-turn names. Register both so the plugin works across
     # Hermes versions, matching the langfuse plugin.
